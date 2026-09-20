@@ -1,18 +1,43 @@
-# Project Notes: Nova Suraksha Voice Agent
+# Nova Suraksha Voice Agent — Complete Project Notes
 
-Everything about this project in one place — what it is, the technologies, how
-every file works, how one turn flows end to end, and the concepts behind it.
+Everything about this project, written so you can explain any part of it in an
+interview: what it is, every technology and why it was chosen, every file and
+what it does, how one conversation flows end to end, the hard problems and how
+they were solved, and the real bugs that were found and fixed along the way.
+
+---
+
+## Contents
+
+1. What this project is
+2. Technologies and why each one
+3. Every file, and what happens when you run it
+4. One conversation, end to end
+5. The hard parts
+6. The business layer
+7. Latency
+8. Testing a voice agent without a microphone
+9. Bugs found and fixed (and how each was diagnosed)
+10. Interview questions, answered
+11. Glossary
 
 ---
 
 ## 1. What this project is
 
-A **voice agent** called Priya that books hospital appointments. You talk into
-your microphone, it listens, thinks, and talks back through your speakers. It
-runs entirely in the terminal — no web UI, no phone line, no telephony.
+**Priya** is a voice agent for a fictional hospital, Nova Suraksha
+Multispeciality Hospital in Hyderabad. You talk to her through a microphone and
+she talks back through your speakers. She can book, cancel and reschedule
+appointments with eight doctors across seven departments, answer questions about
+timings, fees and the address, route emergencies to the emergency line, and
+refuse to give medical advice.
 
-It is built as a **cascading pipeline**: several separate models chained one
-after another, each waiting for the one before it.
+It runs entirely in a terminal. No web page, no phone line, no telephony.
+And it is built **without any voice-agent framework** — no LiveKit, no Pipecat,
+no Vapi. Every step of the pipeline is written by hand in Python so that every
+step can be understood, measured and tuned.
+
+### The pipeline
 
 ```text
  You speak
@@ -21,681 +46,835 @@ after another, each waiting for the one before it.
 ┌───────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────────┐
 │  Mic  │──▶│ VAD │──▶│ STT │──▶│ LLM │──▶│ TTS │──▶│ Speaker │
 └───────┘   └─────┘   └─────┘   └─────┘   └─────┘   └─────────┘
-  audio     detect    speech    think     text       you hear
-  frames    speech    to text   + reply   to speech  the reply
+  20 ms      "are     speech    decide     text      you hear
+  frames     they     to text   what to    to audio  the reply
+             talking?"          say, call
+                                tools
 ```
 
-| Block | Full name | Job here |
+| Stage | What it does | Runs where |
 | --- | --- | --- |
-| VAD | Voice Activity Detection | Decides when you started and stopped talking |
-| STT | Speech To Text | Turns your voice into text (Sarvam Saaras) |
-| LLM | Large Language Model | Reads the text, decides what to say and which tools to call (Sarvam 105B) |
-| TTS | Text To Speech | Turns the reply into audio (Sarvam Bulbul) |
+| Mic | Captures audio in 20 ms frames | Your laptop |
+| VAD | Decides when you started and stopped talking | Your laptop (no network) |
+| STT | Turns your speech into text | Sarvam cloud, streaming over WebSocket |
+| LLM | Reads the text, decides what to say, calls booking functions | Sarvam cloud, streaming over HTTP |
+| TTS | Turns the reply into speech | Sarvam cloud, streaming over WebSocket |
+| Speaker | Plays audio the instant it arrives | Your laptop |
 
-**Why "cascading" matters:** each block waits for the previous one, so every
-slow block adds directly to how long you wait before hearing a reply. That is
-why latency is the central concern of this project.
+This is a **cascading pipeline**: separate models, one feeding the next. Every
+slow stage adds directly to how long you wait for a reply, which is why latency
+is the central engineering concern of the whole project.
 
-The alternative architecture is **speech-to-speech** — a single model that
-takes audio in and produces audio out (like GPT-4o realtime). It is lower
-latency because there are no handoffs, but you lose the ability to inspect and
-control the text in the middle, which is exactly where the booking rules and
-tool calls live. For a business agent that must never invent a fee, the
-cascading approach is the right trade.
+The alternative is **speech-to-speech** — a single model that takes audio in and
+produces audio out. It is faster because there are no handoffs, but there is no
+text in the middle to inspect, and the text in the middle is exactly where the
+booking rules, the tool calls and the "never invent a fee" guarantees live. For
+a business agent, cascading is the right choice.
 
 ---
 
-## 2. Technologies used
+## 2. Technologies and why each one
 
-### Services (all Sarvam AI)
+### The three AI services — all from Sarvam AI
 
-| Layer | Model | Protocol | Why |
+| Layer | Model | Protocol | Why this one |
 | --- | --- | --- | --- |
-| STT | `saaras:v3` | WebSocket | Streaming, Indian languages, servers in India |
-| LLM | `sarvam-105b-conversations` | HTTP streaming, OpenAI-compatible | Tool calling, fast first token |
-| TTS | `bulbul:v3`, voice `priya` | WebSocket | Streaming audio out, Indian English voice |
+| STT | `saaras:v3` | WebSocket, streaming | Indian-English and Indian languages; servers in India (low network latency); streams so transcription runs *while* you talk |
+| LLM | `sarvam-105b-conversations` | HTTP streaming, OpenAI-compatible | Supports tool calling (needed for booking); streams tokens; the only Sarvam chat model currently offered |
+| TTS | `bulbul:v3`, voice `priya` | WebSocket, streaming | Indian-English voice; audio streams back in chunks so playback starts before the sentence is finished |
 
-All three are reached with one `SARVAM_API_KEY` from `.env`.
+One API key (`SARVAM_API_KEY`, in `.env`) covers all three.
 
-The LLM speaks the **OpenAI API format**, which is why the code uses the
-`openai` Python library pointed at a different `base_url`:
+The LLM speaks the **OpenAI API format**, so the standard `openai` Python
+library is used as the client, pointed at Sarvam's server:
 
 ```python
 client = AsyncOpenAI(api_key=config.API_KEY, base_url="https://api.sarvam.ai/v1")
 ```
 
-### Python libraries
+### Python and libraries
 
-| Library | Used for |
+| Library | Used for | Why |
+| --- | --- | --- |
+| Python 3.10 | Everything | |
+| `asyncio` (standard library) | Running mic, STT, LLM and TTS at the same time on one thread | A voice agent is all network waiting — async fits it exactly, with no thread-safety headaches |
+| `sounddevice` | Microphone in, speaker out | Thin wrapper over PortAudio; gives raw PCM frames via a callback |
+| `webrtcvad-wheels` | Voice activity detection | Google's WebRTC VAD; tiny, instant, runs locally with no network |
+| `numpy` | Frame loudness (RMS) | Already a dependency of sounddevice |
+| `websockets` | The STT and TTS connections | Async-native WebSocket client |
+| `openai` | The LLM connection | Sarvam is OpenAI-compatible, so the official SDK works |
+| `python-dotenv` | Loads `.env` | Keeps the API key out of code and out of git |
+
+That is the whole dependency list — six packages. No framework.
+
+### Concepts you should be able to explain
+
+**VAD — Voice Activity Detection.** Software that answers "is this 20 ms of
+audio speech or not?" The two common choices are WebRTC VAD (tiny, local, fast,
+somewhat trigger-happy) and Silero VAD (a small neural network, more accurate,
+heavier). This project uses WebRTC VAD in its strictest mode *plus* a loudness
+gate, because measured in a quiet room the looser modes called most silence
+"speech" (section 9, bug 5).
+
+**Endpointing.** Deciding the user has *finished* their turn. Done here by
+counting silence: after `SILENCE_MS` (450 ms) of continuous non-speech, the
+turn is over. Too short cuts people off mid-thought; too long feels sluggish.
+
+**Streaming.** Every stage sends its output as it is produced rather than at
+the end. STT transcribes while you talk. The LLM sends tokens as it writes.
+TTS sends audio chunks as it synthesizes. This turns a *sum* of waits into an
+*overlap* of waits, and is the single biggest latency technique in the project.
+
+**Partial vs final transcripts.** Streaming STT sends provisional text while
+you talk (which can change) and settled text when you stop (which won't).
+
+**TTFT — Time To First Token.** How long until the LLM's *first* token, not the
+whole reply. For voice this is what matters, because Priya can start speaking
+sentence one while sentence three is still being written.
+
+**TTFB — Time To First Byte.** The TTS equivalent: time until the first chunk
+of audio. A WebSocket TTS beats HTTP because the connection is already open and
+audio streams back in pieces.
+
+**Barge-in.** Interrupting the agent mid-sentence. The agent must stop talking
+immediately and listen. Section 5 covers how, and why it is the hardest part.
+
+**Tool calling (function calling).** The LLM does not book anything itself. It
+emits a structured request — `book(name=..., doctor_id=..., ...)` — the code
+runs the real Python function, and the result goes back to the model. Every
+business rule is enforced in that Python, never trusted to the model.
+
+---
+
+## 3. Every file, and what happens when you run it
+
+```text
+voice-agent/
+│
+│   RUN THESE
+├── agent.py            the agent: python agent.py
+├── step1_mic.py        test stage 1: mic and speaker
+├── step2_vad.py        test stage 2: speech start/end detection
+├── step3_stt.py        test stage 3: live speech to text
+├── step4_llm.py        test stage 4: type to the LLM, watch it stream
+├── step5_tts.py        test stage 5: type text, hear it spoken
+├── step6_e2e.py        the whole agent, scripted, no microphone needed
+├── test_rules.py       44 offline checks of the booking rules, free
+├── calibrate.py        is the VAD sane in this room at this volume?
+│
+│   THE PIPELINE (imported by the above)
+├── config.py           every tunable number in one place
+├── audio_io.py         Mic (frames in) and Player (audio out, instant stop)
+├── vad.py              turns frames into "start" / "end" events
+├── stt.py              Sarvam speech-to-text client
+├── llm.py              Sarvam chat client + sentence splitter
+├── tts.py              Sarvam text-to-speech client
+├── tools.py            the six booking functions; all rules live here
+├── prompt.py           Priya's instructions; the emergency keyword check
+├── latency.py          per-turn timing marks and the summary table
+├── transcript.py       writes every conversation to a timestamped file
+├── harness.py          the machinery that lets step6 run without a mic
+│
+│   DATA
+├── data/hospital_data.json   the hospital and eight doctors
+├── data/bookings.json        every booking (JSON, the source of truth)
+├── data/appointments.txt     every booking event, one readable line each
+├── data/conversations/       one timestamped transcript per session
+├── data/cache/               fixed phrases pre-synthesized to audio
+├── out/                      test output only; wiped on every test run
+│
+│   CONFIG AND DOCS
+├── .env                SARVAM_API_KEY=...   (never committed)
+├── .env.example        the template for .env
+├── .gitignore          keeps .env, venv, data files and test output out of git
+├── requirements.txt    the six dependencies
+├── README.md           how to run, the pipeline, the build order
+├── latency.md          measured numbers, what was tried, what the floor is
+├── notes.md            this file
+└── CLAUDE.md           architecture notes for an AI coding assistant
+```
+
+### Running the agent
+
+#### `agent.py` — `python agent.py`
+
+The program. On start it:
+
+1. Opens the STT and TTS WebSockets and warms the LLM connection, all at once.
+2. Loads the fixed phrases (opening line, emergency line, "One moment.") from
+   `data/cache/`, synthesizing any that are missing.
+3. Detects whether you are on speakers or headphones from the output device
+   name and prints which mode it chose.
+4. Opens a new transcript file under `data/conversations/`.
+5. Speaks the opening line and starts listening.
+
+Then it loops forever: read a 20 ms frame from the mic, feed it through VAD,
+stream speech to STT, and when a turn ends, launch a task to transcribe, think,
+call tools and speak. Ctrl+C closes every connection cleanly, prints the
+latency table for the session, and says `Bye!`.
+
+The `Agent` class is the state machine. Its methods, in the order a turn uses
+them:
+
+| Method | Role |
 | --- | --- |
-| `sounddevice` | Microphone input and speaker output (wraps PortAudio) |
-| `webrtcvad-wheels` | Voice activity detection, runs **locally**, no network |
-| `websockets` | The STT and TTS WebSocket connections |
-| `openai` | HTTP client for the LLM (Sarvam is OpenAI-compatible) |
-| `python-dotenv` | Loads the API key from `.env` |
-| `asyncio` | Standard library — runs everything concurrently |
+| `setup()` | connections, phrase cache, speaker detection, opening line |
+| `step(frame)` | one frame through VAD; the per-frame state transition |
+| `barge_in()` | stop Priya, or merge a pause — section 5 |
+| `handle_turn(turn)` | one user turn: transcript → emergency check → reply |
+| `think_and_speak(turn)` | the LLM loop with tool calls, up to 4 rounds |
+| `speak(text, turn)` | one sentence to TTS |
+| `say_cached(text, turn)` | a pre-synthesized phrase straight to the speaker |
+| `close()` | shut down every connection and device |
 
-No framework. No LiveKit, no Pipecat, no Vapi. The whole pipeline is written by
-hand so every step is visible and understandable.
+### The step scripts — the assignment's build ladder
 
----
+Each one exercises a single stage in isolation. They exist so that when
+something breaks, you can find *which* stage without running the whole agent.
 
-## 3. Core concepts
+| Script | Run it and you get |
+| --- | --- |
+| `step1_mic.py` | Records 5 seconds, prints the shape, byte count and loudest sample, plays it back. Proves the sound card works and shows what "16 kHz, mono, int16" means in bytes. |
+| `step2_vad.py` | Prints `SPEECH START` / `SPEECH END` as you talk. Tune `SILENCE_MS` here. |
+| `step3_stt.py` | Streams your voice to Sarvam STT, prints pieces as they arrive and the final text with the time it took after you stopped. |
+| `step4_llm.py` | A text chat: type a line, watch the reply stream token by token, see the TTFT in ms. |
+| `step5_tts.py` | Type a sentence, hear it in Priya's voice, see the TTFB in ms. |
 
-These are the ideas the code is built on. Your assignment lists them as things
-you should be able to explain out loud.
+### Testing
 
-### VAD (Voice Activity Detection)
+#### `test_rules.py` — `python test_rules.py`
 
-Software that answers "is this 20 ms of audio speech or not?" Two common ones:
+44 checks of the booking logic, sentence splitting and VAD. Free, instant, no
+API, no microphone. It writes to `out/`, never to the real data files.
 
-- **WebRTC VAD** — tiny, runs locally, instant, no network. Used here.
-- **Silero VAD** — a small neural net, more accurate (better at rejecting
-  background noise), slightly heavier.
+Covers every rule in the business brief: Sunday refused, lunch hour refused,
+more than 14 days ahead refused, past dates, 9-digit phones, unknown doctors,
+days a doctor doesn't work, children under 14 routed to Pediatrics, one
+appointment per patient per doctor per day, taken slots, the free follow-up
+within 7 days, the 2-hour cancel/reschedule cutoff, `find_booking` never
+leaking another patient's data, and that every booking event is written to
+`appointments.txt` in order.
 
-WebRTC VAD has 4 aggressiveness modes (0 relaxed → 3 strict). This project uses
-mode 2 (`config.VAD_MODE`).
+One detail worth knowing: the "30 minutes ahead" rule depends on the current
+time, so the test **freezes the clock** to a Monday at 10:00 by swapping in a
+fake `datetime` class. Otherwise it could only run during OPD hours.
 
-### Endpointing and the silence timeout
+#### `step6_e2e.py` — `python step6_e2e.py`
 
-**Endpointing** is deciding that the user has finished their turn. This project
-does it by counting silence: after `SILENCE_MS` (500 ms) of continuous
-non-speech, the turn is over.
+The whole agent, driven by a script, **with no microphone**. Section 8 explains
+the trick. Three scenarios:
 
-This single number is a real trade-off:
+- **emergency** — "my father has chest pain and is sweating a lot" → the
+  emergency line is spoken, the LLM is never called, no booking is made.
+- **barge-in** — Priya is asked a long question; mid-answer she is interrupted.
+  Asserts the audio buffer is empty on the interrupting frame and the recording
+  is silent afterwards.
+- **booking** — four lines that complete a real booking with Dr. Sanjay Rao,
+  then asserts the row in `bookings.json`: right doctor, ₹900, status booked.
 
-- **Too short** → the agent interrupts you when you pause to think mid-sentence.
-- **Too long** → the agent feels slow and unresponsive.
+Prints the latency table at the end and saves Priya's audio as WAV files in
+`out/`. Flags: `--dry` runs only the VAD and STT checks on the scripted lines
+(no LLM cost — run this first), `--only booking` runs one scenario, `--loud`
+plays through the speakers instead of recording silently.
 
-300–500 ms is the usual range. 500 ms is used here, at the slow-but-safe end.
+#### `calibrate.py` — `python calibrate.py`
 
-### Partial vs final transcripts
+Measures whether the VAD behaves in *your* room at *your* volume. Records
+6 seconds of ambient noise, then plays speech through the speakers while
+recording the mic, and runs the real `TurnDetector` over both. Reports the
+noise floor, the echo level, and whether either produces a false "speech
+start". Run it in a quiet room; it cannot tell a person talking nearby from
+you, and no VAD can.
 
-Streaming STT sends two kinds of results:
+### The pipeline modules
 
-- **Partial (interim)** — a live guess while you are still talking, which can
-  change as more audio arrives ("I want to" → "I want to book").
-- **Final** — the settled transcript for a chunk, which will not change.
+#### `config.py`
 
-Sending audio *while* the user talks means that when they stop, most of the
-transcription work is already done — you only wait for the last bit.
+Every tunable number, with a comment explaining each. Audio format (16 kHz,
+20 ms frames, 640 bytes per frame), VAD settings, speaker-mode settings, the
+Sarvam model names, history length, the instant phrases, cache and log paths.
+Change the sample rate here and nothing else needs touching, because every
+module imports its numbers from here.
 
-### TTFT (Time To First Token)
+#### `audio_io.py`
 
-How long the LLM takes to produce its **first** token, not its whole reply.
-This is what matters for voice, because you can start speaking sentence one
-while the model is still writing sentence three. Smaller/faster models have
-lower TTFT. Shorter prompts and shorter history also lower it.
+**`Mic`** opens an input stream. The sound card calls back on *its own thread*
+every 20 ms; the frame is handed to the asyncio loop with
+`loop.call_soon_threadsafe(queue.put_nowait, frame)`. That one line is the
+bridge between the audio thread and the async world.
 
-### Token streaming
+**`Player`** holds a byte buffer the sound card drains. Three things about it
+matter:
 
-The LLM sends tokens as it generates them rather than one complete response at
-the end. This is what makes "start talking before the model has finished
-thinking" possible.
+- `stop()` clears the buffer, so audio stops *instantly*. If audio were written
+  to a file and played, you could not cut it off mid-word. Barge-in depends on
+  this.
+- `busy()` says whether anything is queued — how the agent knows Priya is
+  currently making sound.
+- `watch_next(callback)` fires when audio queued *from now on* actually reaches
+  the sound card, even if something earlier is still playing. It is how the
+  latency log marks the moment the *answer* starts rather than the moment a
+  cached phrase ahead of it does.
 
-### TTFB (Time To First Byte)
+#### `vad.py`
 
-The TTS equivalent — how long until the **first chunk of audio** arrives.
-A WebSocket TTS beats a plain HTTP one because:
+`TurnDetector.feed(frame)` returns `"start"`, `"end"` or `None`. A frame is
+speech only if **two** independent tests agree: `webrtcvad` says so, *and* the
+frame's loudness (RMS) clears a gate. The gate adapts: it is the larger of
+`MIN_RMS` and four times the rolling noise floor (the quietest fifth of the last
+3 seconds). Consecutive speech frames for `START_MS` fire "start"; consecutive
+silence for `SILENCE_MS` fires "end". Callers can raise the gate and the start
+time for one frame at a time — that is how speaker mode works.
 
-- the connection is already open (no DNS + TCP + TLS handshake per request),
-- audio streams back in chunks as it is synthesized, instead of the server
-  rendering the whole sentence and then sending one big file.
+#### `stt.py`
 
-### Barge-in
+`SarvamSTT`. Connects once and stays connected. `send(frame)` batches five
+frames into one 100 ms message (fewer, larger messages are cheaper than one per
+frame). Each message is a tiny WAV — 44-byte header plus PCM — base64 encoded,
+because that is what the API expects. `final_text()` sends a `flush` and waits
+briefly for the transcript. Handles the server closing idle sockets by
+reconnecting and re-sending the chunk that failed.
 
-When the user starts talking while the agent is still speaking, the agent must
-**shut up immediately** and listen. Without it, a voice agent feels robotic and
-frustrating. This is the hardest part of the project to get right and is
-covered in detail in section 6.
+#### `llm.py`
 
-### The key idea: never wait when you can stream
+`stream_reply(messages, tools)` is an async generator. It yields
+`("text", piece)` as words arrive, `("tool_start", None)` the instant the model
+begins a tool call (so a filler can play while the arguments stream in), and
+`("tools", calls)` at the end if the model wants functions run. Tool-call
+arguments arrive as JSON *fragments* across many chunks and are reassembled by
+index.
 
-```text
-Slow:  wait for all STT → wait for all LLM → wait for all TTS → play
-Fast:  STT streams → LLM streams tokens → each finished sentence goes
-       straight to TTS → audio chunks play as they arrive
-```
+`split_sentences(buffer)` cuts finished sentences off the front of the
+accumulating text so each can go to TTS immediately. It knows "Dr." is not the
+end of a sentence.
 
----
+#### `tts.py`
 
-## 4. The files
-
-```text
-config.py      all tunable settings in one place
-audio_io.py    Mic (frames into a queue), Player (plays bytes, instant stop)
-vad.py         turns 20 ms frames into "start" / "end" events
-stt.py         Sarvam STT WebSocket client
-llm.py         Sarvam chat streaming + tool calls + sentence splitter
-tts.py         Sarvam TTS WebSocket client
-tools.py       booking functions — every business rule is enforced here
-prompt.py      Priya's system prompt, emergency keyword check
-latency.py     per-turn timings, average and worst at exit
-agent.py       joins everything together with asyncio
-
-step1_mic.py … step5_tts.py   one script per pipeline stage, for testing
-step6_e2e.py   full scripted conversation with no microphone
-harness.py     the machinery step6 uses
-test_rules.py  offline tests of the booking rules
-```
-
-### `config.py` — one place for every knob
-
-```python
-RATE = 16000            # 16 kHz, the standard for speech
-FRAME_MS = 20           # audio handled in 20 ms pieces
-FRAME = 320             # 16000 * 20 / 1000 samples per frame
-BYTES_PER_FRAME = 640   # int16 = 2 bytes per sample
-
-VAD_MODE = 2            # 0 relaxed … 3 strict
-START_MS = 100          # this much speech = user started
-SILENCE_MS = 500        # this much silence = user finished
-PREROLL_MS = 300        # audio kept from just before speech started
-
-HISTORY_MESSAGES = 12   # only recent turns are sent to the LLM
-```
-
-**One audio format everywhere.** 16 kHz, mono, 16-bit PCM, 20 ms frames — from
-the microphone all the way to the speaker. No resampling anywhere in the
-pipeline, which removes an entire category of "why is it noise/silence" bugs.
-Changing the sample rate means editing this file only.
-
-### `audio_io.py` — microphone and speaker
-
-**`Mic`** opens a `sounddevice.RawInputStream`. The sound card calls
-`_on_audio` on **its own thread**, which is not the asyncio thread — so the
-frame is handed across safely:
-
-```python
-def _on_audio(self, data, frames, time_info, status):
-    # runs in the sound card thread, not in asyncio
-    self.loop.call_soon_threadsafe(self.queue.put_nowait, bytes(data))
-```
-
-`call_soon_threadsafe` is the bridge between the two worlds. The agent then
-just reads `await mic.queue.get()`.
-
-**`Player`** holds a `bytearray` buffer guarded by a lock. The sound card
-callback `_fill` drains it, zero-padding when it runs dry:
-
-```python
-def stop(self):
-    with self.lock:
-        self.buf.clear()      # instant silence — this is what barge-in needs
-```
-
-Two things here are load-bearing:
-
-- `stop()` clears the buffer, so audio stops *immediately*. If audio were
-  written to a file and played back, you could not cut it off mid-word.
-- `busy()` returns `len(self.buf) > 0` — the agent uses this to know whether
-  Priya is currently making noise.
-- `on_start` is a one-shot callback fired the moment real audio first reaches
-  the sound card. That is what marks the `playback_start` latency point.
-
-### `vad.py` — turn detection
-
-Tiny and frame-counted (no clocks):
-
-```python
-def feed(self, frame):
-    is_speech = self.vad.is_speech(frame, config.RATE)
-    if is_speech:
-        self.speech_ms += config.FRAME_MS; self.silence_ms = 0
-    else:
-        self.silence_ms += config.FRAME_MS; self.speech_ms = 0
-
-    if not self.speaking and self.speech_ms >= config.START_MS:
-        self.speaking = True;  return "start"
-    if self.speaking and self.silence_ms >= config.SILENCE_MS:
-        self.speaking = False; return "end"
-    return None
-```
-
-Note it counts *consecutive* speech/silence — a single stray frame resets the
-counter, which filters out clicks and pops.
-
-### `stt.py` — speech to text over WebSocket
-
-- Connects once, at startup, and stays connected (a warm connection saves
-  ~100–300 ms of handshake on every turn).
-- `send()` **batches 5 frames = 100 ms** per message rather than sending every
-  20 ms frame separately — far fewer, larger messages is more efficient.
-- Each message is a small WAV (44-byte header + PCM), base64-encoded, because
-  that is the format this API expects.
-- `final_text()` sends a `flush` signal, then waits briefly for the transcript.
-  If pieces have already arrived it only waits 0.4 s; if none have, it waits up
-  to 1.5 s.
-
-```python
-async def send(self, frame):
-    self.pending.extend(frame)
-    if len(self.pending) >= config.BYTES_PER_FRAME * 5:   # 100 ms
-        await self._send_pending()
-```
-
-### `llm.py` — streaming replies and tool calls
-
-`stream_reply` is an **async generator**. It yields as the model produces
-output:
-
-- `("text", "some words")` — text to speak, as it arrives
-- `("tools", [...])` — at the end, if the model wants to call functions
-
-Tool-call arguments arrive **split across many chunks**, so they are
-accumulated by index before being used:
-
-```python
-for tc in delta.tool_calls or []:
-    c = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
-    if tc.function.arguments:
-        c["args"] += tc.function.arguments     # JSON arrives in pieces
-```
-
-**`split_sentences`** is the piece that makes the agent feel fast. It cuts
-completed sentences off the front of a buffer so each one can go to TTS while
-the model is still writing:
-
-```python
-for m in re.finditer(r"[.?!]\s", buf):
-    ...
-    if last_word in ABBREV:      # {"dr", "mr", "mrs", "ms", "no"}
-        continue                 # "Dr. Rao" is not two sentences
-```
-
-The abbreviation guard matters: without it, "Dr. Sanjay Rao is free." would be
-spoken as "Dr." then "Sanjay Rao is free." with an unnatural gap.
-
-### `tts.py` — text to speech over WebSocket
-
-The protocol is: open socket → send a `config` message → then `text` + `flush`
-per sentence. Audio comes back as base64 chunks and goes straight to the
-player.
+`SarvamTTS`. The protocol: open the socket, send a `config` message (voice,
+language, sample rate), then `text` + `flush` per sentence. Audio comes back
+base64-encoded and goes straight into the `Player`.
 
 Two mechanisms worth understanding:
 
-**The `idle` latch.** The server sends `{"type":"event","data":{"event_type":"final"}}`
-after each flush finishes. The code counts flushes sent vs completions received:
+- **The `idle` latch.** The server sends a `final` event after each flush. The
+  client counts flushes sent against completions received; `idle` is set only
+  when they match. This is how anything can know "Priya has completely finished
+  speaking" without guessing with a timer.
+- **`detach()`** synchronously orphans the current socket so that audio still
+  in flight from it is dropped the instant a barge-in happens. `reset()` then
+  closes it and opens a fresh one.
 
-```python
-self.flushes += 1        # in say()
-self.idle.clear()
-...
-self.completions += 1    # in _receive(), on a "final" event
-if self.completions >= self.flushes:
-    self.idle.set()
-```
+`render(text)` synthesizes to bytes instead of the speaker — used to build the
+phrase cache.
 
-This is how anything can know "Priya has genuinely finished speaking" rather
-than guessing with a timer.
+#### `tools.py`
 
-**`detach()`** synchronously orphans the current socket:
+The six functions the LLM can call, and every business rule:
 
-```python
-def detach(self):
-    old, self.ws = self.ws, None     # _receive() drops frames from now on
-    ...
-```
+| Function | Does |
+| --- | --- |
+| `list_doctors(dept)` | doctors in a department, or all |
+| `check_slots(doctor_id, date)` | free 15-minute slots that day, or why there are none |
+| `book(name, age, phone, doctor_id, date, time, visit)` | validates everything, writes the booking, returns id and fee |
+| `find_booking(phone)` | that phone's upcoming bookings — nobody else's |
+| `cancel(booking_id)` | up to 2 hours before |
+| `reschedule(booking_id, date, time)` | same rules as booking |
 
-`_receive` checks `if ws is not self.ws: break`, so nulling `self.ws`
-immediately stops audio from a socket being abandoned. Doing this
-asynchronously would let in-flight audio refill the buffer that barge-in just
-cleared — see section 6.
+`validate_slot()` is the single source of truth for "can this slot be booked",
+reused by `check_slots`, `book` and `reschedule`. `book`, `cancel` and
+`reschedule` each append one readable line to `data/appointments.txt` and save
+`data/bookings.json`. The LLM only ever sees the function schemas (`TOOLS`) and
+JSON results; it never touches the files.
 
-### `latency.py` — measuring everything
+#### `prompt.py`
 
-Six named marks per turn:
+`build_prompt()` assembles Priya's system prompt **every turn**: the current
+date and time, a rolling 15-day calendar, the hospital details, the doctor
+roster, the booking flow, the rules and the voice style. The calendar is how
+"next Wednesday" becomes `2026-09-23` — the model reads it off a list rather
+than calculating. `is_emergency(text)` is a plain keyword check that runs
+before the LLM is ever called.
 
-```python
-ORDER = ["vad_end", "stt_final", "llm_first_token",
-         "first_sentence_ready", "tts_first_audio", "playback_start"]
-```
+#### `latency.py`
 
-The important subtlety:
+Records named moments in each turn — `vad_end`, `stt_final`, `filler_start`,
+`llm_first_token`, `first_sentence_ready`, `tts_first_audio`, `playback_start`
+— with `time.perf_counter()`. Zero is when the user *actually stopped talking*:
+VAD only notices `SILENCE_MS` later, so `t0` is backdated by that much. Without
+this the numbers would hide the endpointing wait and look 450 ms better than
+they are. Prints a per-turn report and an average/worst table at exit.
 
-```python
-self.t0 = now - config.SILENCE_MS / 1000
-```
+#### `transcript.py`
 
-Zero is when the user **actually stopped speaking**, not when VAD noticed —
-which is 500 ms later. Without this backdating, the numbers would silently hide
-the endpointing wait and look 500 ms better than reality.
+`Transcript` writes one file per session under `data/conversations/`. Every
+user line, everything Priya said (including replies that were cut off), every
+tool call with its result, barge-ins, pauses and STT socket events — each
+stamped `[YYYY-MM-DD HH:MM:SS]` and flushed immediately so nothing is lost on a
+crash. When something goes wrong in a conversation, read this file first.
+
+#### `harness.py`
+
+Everything `step6_e2e.py` needs to drive the agent without a microphone:
+a fake mic, a recording player, a `Voice` that synthesizes the *user's* lines
+with Sarvam TTS and caches them, a `Pump` that feeds frames at true wall-clock
+rate, and the turn-completion latch. Section 8.
+
+### Data files
+
+| File | What it is |
+| --- | --- |
+| `data/hospital_data.json` | Hospital details and the eight doctors: id, name, department, days, hours, fee. Edit this to change the roster. |
+| `data/bookings.json` | Every booking as JSON, with `booked_at`. The source of truth. Delete it to reset. |
+| `data/appointments.txt` | The same events, one line each: `BOOKED`, `RESCHEDULED`, `CANCELLED`, with patient, doctor, slot and fee. For reading. |
+| `data/conversations/` | One transcript per session, named by start time. |
+| `data/cache/` | The opening line, emergency line and filler as raw PCM. Built on first run; deleting it just means they get synthesized again. |
+| `out/` | Test output. Wiped at the start of every test run except `out/voices/`, the cached user-voice lines that keep re-runs free. |
 
 ---
 
-## 5. One turn, end to end
+## 4. One conversation, end to end
 
-Trace what happens when you say *"I want to book with the heart doctor."*
+What happens when you say *"I want to book with the heart doctor on Wednesday."*
 
-1. **Mic** delivers 20 ms frames into an `asyncio.Queue`, continuously.
-2. `Agent.step(frame)` feeds each frame to the **VAD**.
-3. Before speech is confirmed, frames go into `preroll` — a 300 ms ring buffer.
-   This exists because VAD needs 100 ms of speech before it says "start", so
-   without preroll the first syllable would be lost.
+1. The **mic** delivers 20 ms frames into an asyncio queue, continuously.
+2. `Agent.step()` feeds each frame to the **VAD**.
+3. Before speech is confirmed, frames go into `preroll`, a 300 ms ring buffer.
+   VAD needs 200 ms of speech before it says "start", so without preroll the
+   first syllable would be lost.
 4. VAD returns **`"start"`**. The preroll is flushed into STT, then live frames
    stream to STT as you keep talking.
-5. You stop. 500 ms later VAD returns **`"end"`**. A `Turn` is created and
-   `handle_turn` is launched as its own task.
-6. `stt.final_text()` flushes and returns the transcript → mark `stt_final`.
-7. **Emergency check first** — `is_emergency(text)` is a plain keyword scan
-   that runs *before* the LLM is ever called. Emergencies never depend on model
-   behaviour.
-8. Otherwise `think_and_speak` sends `[system prompt] + history` to the LLM and
-   streams the reply.
-9. First text token → mark `llm_first_token`. Text accumulates; every time
-   `split_sentences` finds a complete sentence it goes straight to TTS → mark
-   `first_sentence_ready`.
-10. If the model asked for a tool, the agent says a filler ("One moment, let me
-    check.") so you do not hear dead silence, runs the function, appends the
-    result, and loops. Up to 4 tool rounds.
-11. TTS audio chunks arrive → mark `tts_first_audio` → into the player buffer.
-12. The sound card pulls the first bytes → mark `playback_start`. **This is the
-    number that matters** — it is when you actually hear Priya.
-13. The reply is appended to history, which is trimmed to the last 12 messages.
-14. The timing report prints from its own task.
+5. You stop. 450 ms later VAD returns **`"end"`**. A `Turn` is created for
+   timing and `handle_turn()` is launched as its own task.
+6. `stt.final_text()` sends a flush and returns the transcript → `stt_final`.
+7. The transcript is written to the conversation log and appended to history.
+8. **Emergency check first.** `is_emergency()` is a keyword scan. If it hits,
+   the cached emergency line plays immediately and the LLM is never called.
+9. Otherwise the system prompt is rebuilt with today's date and calendar, the
+   last 40 messages of history are attached, and the **LLM** is streamed.
+10. The model decides it needs availability and begins a tool call. The
+    instant the first tool-call chunk arrives, the cached **"One moment."**
+    plays → `filler_start`. The arguments finish streaming; `check_slots("D03",
+    "2026-09-23")` runs; the result goes back to the model.
+11. The model now writes text. First token → `llm_first_token`. Text
+    accumulates; the moment `split_sentences` finds a complete sentence it goes
+    to **TTS** → `first_sentence_ready`. The model keeps writing sentence two
+    while sentence one is being synthesized.
+12. TTS audio chunks arrive → `tts_first_audio` → into the player buffer.
+13. The sound card pulls the first bytes of the answer → `playback_start`.
+    **This is the number that matters** — when you actually hear Priya.
+14. The reply is logged and appended to history. The timing report prints from
+    a separate task so it can never delay the next turn.
 
-### The tool loop
-
-```python
-for _ in range(4):                 # max 4 tool rounds
-    async for kind, value in llm.stream_reply(messages, TOOLS):
-        if kind == "text":
-            ... speak each finished sentence ...
-        else:
-            calls = value
-    if not calls:
-        break
-    if not self.spoken:
-        await self.speak("One moment, let me check.", turn)   # no dead air
-    for c in calls:
-        result = run_tool(c["name"], c["args"])
-        messages.append({"role": "tool", "tool_call_id": c["id"], ...})
-```
+Then the flow, by design of the prompt, is **availability first**: Priya offers
+the doctor, date and two or three times before asking for anything personal.
+Only once you pick a slot does she collect name, age, phone and visit type —
+skipping anything you already said — read it all back, get a clear yes, and
+call `book()`. Then: *"Your appointment is confirmed. Please come fifteen
+minutes early. Take care!"*
 
 ---
 
-## 6. Barge-in — the subtle part
+## 5. The hard parts
 
-When speech starts while the agent is busy, there are **two different
-situations** that look identical to the VAD:
+### Barge-in, and telling a pause from an interruption
+
+When speech starts while the agent is busy, two very different things could be
+happening, and they look identical to the VAD:
 
 | Situation | What actually happened | Right response |
 | --- | --- | --- |
-| **Pause** | Priya has not said anything yet. You just paused mid-sentence to think. | Keep your words, join them with what comes next |
-| **Interrupt** | Priya is already talking. You are cutting her off. | Stop the audio immediately and listen |
+| **Pause** | Priya hasn't said anything yet; you paused mid-sentence to think | Keep your words, merge them with what comes next |
+| **Interrupt** | Priya is talking; you are cutting her off | Stop the audio instantly and listen |
 
-The code distinguishes them by checking whether Priya has spoken yet:
+The code tells them apart by whether Priya has spoken yet this turn:
 
 ```python
-running = self.reply_task and not self.reply_task.done()
 if running and not self.spoken:
-    # PAUSE: keep the text, merge it with the next part
+    # PAUSE: keep the partial text, cancel the reply, merge with the next part
     self.carry = ...
     self.reply_task.cancel()
     return
 
-# INTERRUPT: stop everything
-print("[BARGE-IN] stopping Priya")
-if running:
-    self.reply_task.cancel()
-self.tts.detach()      # synchronous — see below
-self.player.stop()     # instant silence
-asyncio.create_task(self.tts.reset())
+# INTERRUPT
+self.reply_task.cancel()             # stop generating
+old = self.tts.detach()              # stop new audio arriving, synchronously
+self.player.stop()                   # drop audio already queued
+asyncio.create_task(self.tts.reset(old))
 ```
 
-So saying *"I want to book…"* [pause] *"…with the heart doctor"* is understood
-as one sentence, not two fragments, and the half-sentence is never sent to the
-LLM on its own.
+So *"I want to book…"* [pause] *"…with the heart doctor"* is understood as one
+sentence, and the half-sentence never reaches the LLM on its own.
 
-**Why `detach()` must be synchronous.** `tts.reset()` is a coroutine. If the
-socket were only abandoned inside that task, then between `player.stop()` and
-the task actually running, `_receive` would still consider the socket current
-and would keep calling `player.play()` — refilling the buffer that was just
-cleared. Priya would keep talking after being interrupted, unpredictably.
-`detach()` nulls `self.ws` immediately, so the abandoned socket's frames are
-dropped from that instant.
+All three steps of the interrupt must happen, and the detach must be
+*synchronous*: if the socket were only abandoned inside the background task,
+audio still in flight would refill the buffer that was just cleared and Priya
+would keep talking for a moment after being interrupted. That exact bug was
+found and fixed (section 9, bug 2).
 
-Three things must all happen for a clean barge-in:
+### Working without headphones
 
-1. Cancel the reply task (stop generating more)
-2. Detach the TTS socket (stop new audio arriving)
-3. Clear the player buffer (stop audio already queued)
+On speakers, the mic hears Priya. There is no acoustic echo cancellation in
+this project, and adding real AEC means compiling C libraries on Windows. So
+this was measured instead. At normal volume, the echo at the mic peaks at RMS
+6500 — as loud as a real voice — so no simple loudness threshold can separate
+them.
 
-Miss any one and the agent keeps talking over you.
+But the *shape* is different. Echo is **bursty**; speech is **sustained**. At
+RMS ≥ 800, echo never ran more than 8 frames (160 ms) in a row, while real
+speech sustained 29–41 frames. So while Priya is talking, plus a 400 ms tail
+for what is still coming out of the speaker, a barge-in must be loud for
+**300 ms straight**. Echo never qualifies. A person who speaks up does. The
+trade: on speakers you interrupt with a firm voice, not a mumble. On
+headphones there is no echo path, so the normal sensitive gate applies. The
+agent picks the mode from the output device name at startup.
+
+### VAD that survives a real room
+
+`webrtcvad` mode 2 called **81 %** of a quiet room's silence "speech" (measured:
+RMS ~70, nobody talking). Mode 3 called it 1 %. So the project uses mode 3 and
+adds a loudness gate that must *also* pass. The gate adapts to the room — four
+times the rolling noise floor — so it sits low in a quiet room and rises when a
+fan is on. `START_MS` is 200 ms so a keystroke or a tap cannot start a turn.
+None of this can filter out a *person* talking near the mic; that is speech.
+
+### Memory that lasts a whole booking
+
+Voice turns are short — "Yeah", "Okay", "Ages 22". A booking collects seven
+things over seven to ten exchanges. The history was originally trimmed to 12
+messages (six exchanges), and in a real conversation the chosen doctor and time
+were trimmed out of the model's memory before the phone number arrived; Priya
+then asked which doctor the caller wanted. It is 40 now. Only spoken text goes
+into history — tool calls and results do not — so 40 messages is about 1000
+tokens, roughly 130 ms of extra TTFT mid-conversation. Correctness wins.
+
+### Knowing when a reply is *finished* (the harness)
+
+To drive the agent with a script you must know when it has completely finished
+answering, or the next line lands on top of the reply and triggers an
+unintended barge-in. No single signal is right: the reply task returns before
+any audio has arrived; the player buffer is momentarily empty *between*
+sentences; the TTS completion event fires once per sentence, not once per
+reply. The harness requires all three at once — task done **and** TTS idle
+**and** player empty — and the ordering makes it airtight: once the task is
+done no new sentence can be sent, so once TTS is idle no new audio can arrive,
+so once the player is empty it stays empty.
 
 ---
 
-## 7. The business layer
+## 6. The business layer
 
 ### Where the rules live
 
-The system prompt tells the model how to behave, but **every rule is enforced
-in Python** in `tools.py`. The LLM can hallucinate; the code is the final
-check. `validate_slot()` is the single source of truth, reused by
-`check_slots`, `book` and `reschedule`:
+The prompt tells the model how to *behave*. Every rule is *enforced* in
+`tools.py`. The model can be wrong; the code is the final check. From the
+brief:
 
-```python
-def validate_slot(doc, date_str, time_str, rows, skip_id=None):
-    problem = date_problem(doc, day)        # past / >14 days / Sunday / doctor's days
-    if lunch_a <= minutes(time_str) < lunch_b:  return "No appointments during lunch…"
-    if time_str not in all_slots(doc):          return "That time is not a valid slot…"
-    if when < datetime.now() + min_ahead:       return "Slot must be at least 30 minutes…"
-    if time_str in taken_times(...):            return "That slot is already booked."
-```
-
-### The six tools
-
-| Tool | Input | Returns |
-| --- | --- | --- |
-| `list_doctors(dept)` | department (optional) | doctors in that department |
-| `check_slots(doctor_id, date)` | doctor, date | free times, or why there are none |
-| `book(name, age, phone, doctor_id, date, time, visit)` | patient + slot | booking id + fee, or an error |
-| `find_booking(phone)` | phone | that phone's upcoming bookings only |
-| `cancel(booking_id)` | booking id | ok, or an error |
-| `reschedule(booking_id, date, time)` | booking id + new slot | ok, or an error |
-
-Rules enforced in code: 14-day booking window, 30-minute minimum lead time, no
-Sunday, no lunch hour (13:00–14:00), 15-minute slots, one appointment per
-patient per doctor per day, children under 14 routed to Pediatrics, follow-ups
-free within 7 days of a first visit with the same doctor, cancel/reschedule
-only up to 2 hours before.
-
-Data lives in `data/hospital_data.json` (8 doctors, hospital details) and
-bookings are appended to `data/bookings.json`. No database.
+| Rule | Enforced in |
+| --- | --- |
+| Book from today up to 14 days ahead | `date_problem()` |
+| Same-day only if the slot is 30+ minutes away | `validate_slot()` |
+| One appointment per patient per doctor per day | `book()` |
+| No Sunday, no lunch hour (13:00–14:00) | `date_problem()`, `validate_slot()` |
+| 15-minute slots within each doctor's hours | `all_slots()` |
+| Children under 14 go to Pediatrics | `book()` |
+| Follow-up within 7 days of a first visit is free | `book()` |
+| Cancel or reschedule only up to 2 hours before | `cancel()`, `reschedule()` |
+| Phone must be 10 digits | `book()` |
+| Never see another patient's booking | `find_booking()` filters by phone |
 
 ### The prompt
 
-`build_prompt()` is rebuilt **every turn** because it embeds the current time
-and a rolling 15-day calendar:
+Three sections matter most:
 
-```text
-NOW: Saturday 2026-09-19 23:26
-NEXT 15 DAYS: Sat 2026-09-19, Sun 2026-09-20, Mon 2026-09-21, …
-```
+**Availability first.** When the caller names a department, a doctor or a
+symptom, call `check_slots` for each matching doctor and offer names, date and
+times *before* asking for personal details. Then collect only what the caller
+has not already said. (An earlier wording, "Collect: name, age, phone…", made
+the model interrogate first — one line changed that.)
 
-That calendar is how "next Wednesday" becomes `2026-09-23`. The model does the
-date arithmetic by reading it off a list, which it is far more reliable at than
-calculating dates from scratch.
+**Rules.** No medical advice, no medicine names. Emergency words mean stop
+booking and give the emergency number. Never invent doctors, times or fees. Never
+take payment. Never share other patients' details.
 
-The voice style rules matter as much as the business rules:
+**Voice style.** One or two short sentences. No lists, no markdown, no emojis —
+you cannot hear `**bold**`. "Doctor" not "Dr.". Times as "eleven fifteen AM",
+fees as "nine hundred rupees", phone numbers digit by digit in two groups of
+five. Everything written for the ear.
 
-```text
-Reply in 1 or 2 short sentences. Warm, calm, polite.
-No lists, no markdown, no emojis, no symbols.
-Write Doctor instead of Dr.
-Say times like eleven fifteen AM. Say fees like nine hundred rupees.
-Say phone numbers digit by digit in two groups of five.
-```
+### Emergencies bypass the model
 
-You cannot speak `**bold**` or a bulleted list. Everything must be written for
-the ear.
-
-### Emergencies bypass the model entirely
-
-```python
-EMERGENCY_WORDS = ["chest pain", "can't breathe", "heavy bleeding",
-                   "unconscious", "accident", "heart attack", "stroke", …]
-
-if is_emergency(text):
-    await self.speak(EMERGENCY_LINE, turn)     # LLM never called
-```
-
-A keyword scan is dumber than the model but it cannot be talked out of it, and
-for "my father has chest pain" that is exactly the property you want.
+"chest pain", "can't breathe", "unconscious", "accident", "heart attack" and a
+few more are matched by a plain keyword scan before the LLM runs. It is dumber
+than the model, but it cannot be talked out of it, and for "my father has chest
+pain" that is exactly the property you want. The response is pre-synthesized
+and plays in about 0.8 seconds.
 
 ---
 
-## 8. Testing
+## 7. Latency
 
-The problem: testing a voice agent normally requires a human with a
-microphone. Two levels solve most of it.
+Measured with `step6_e2e.py` (synthesized speech through the real pipeline).
+Zero is when the user stopped speaking.
 
-### Offline — `python test_rules.py`
+| Moment | Typical | What it is |
+| --- | --- | --- |
+| ~1.7 s | `filler_start` | "One moment." — cached, plays the instant a tool call starts |
+| 1.7–3.0 s | `playback_start` | the actual answer |
+| ~0.8 s | emergency, total | the whole emergency line, cached |
 
-40 checks, no API calls, instant, free. Covers every booking rule and edge
-case, sentence splitting, and VAD. Uses a frozen clock so the "30 minutes
-ahead" rule can be tested at any hour:
+Best real-answer turns land at about **1.65 s**. That is the floor, and it was
+measured stage by stage:
 
-```python
-class FakeDatetime(datetime):
-    @classmethod
-    def now(cls, tz=None):
-        return frozen
-tools.datetime = FakeDatetime
-```
+| Stage | Measured | What was tried |
+| --- | --- | --- |
+| LLM first token | ~950 ms | Only one usable model exists; `sarvam-105b` is a reasoning model that streams thinking and never text; smaller Sarvam models are deprecated. No prefix caching (repeating an identical prompt does not speed up). Prompt size costs ~160 ms for the full 700 tokens. |
+| TTS first byte | ~450 ms | Already at the fastest settings the API accepts. |
+| STT final | ~250 ms | Wait cap tightened; rarely hit. |
+| Endpointing | 450 ms | Swept 250–500 ms against real speech: below 450, natural phrase pauses split one sentence into two or three turns. |
 
-### End to end with no microphone — `python step6_e2e.py`
+None of the three services can be made faster from this side, so the agent
+covers the gap instead:
 
-The trick: **Sarvam TTS speaks the user's lines too.** That audio is fed into
-the agent as 20 ms mic frames, so the real VAD, STT, LLM, tools and TTS all
-run with no human present.
+- **Cached phrases.** The opening, the emergency line and the filler are
+  synthesized once into `data/cache/` and played with no round trip. Emergency
+  turns went from ~1.5 s to ~0.8 s.
+- **The filler fires on the first tool-call chunk**, not after the tool round
+  finishes — about a second earlier on booking turns. It was shortened from
+  "One moment, let me check." (2 s of audio) to "One moment." (0.7 s), because
+  the long one was still playing when the answer arrived and the answer queued
+  behind it — measured as a 600 ms delay.
+- **LLM warm-up at startup.** The first HTTPS call pays ~2.5 s of TLS setup;
+  it now happens before the opening line, not on the caller's first turn.
+- An instant "Okay." at 0.75 s was built and measured to work (`config.ACK`),
+  but a word before *every* reply got tiresome in a real conversation. It ships
+  off.
+
+A lesson from the measuring: the first probe appeared to show one setting at
+180 ms against 3320 ms for another. That was entirely TLS setup on a cold
+connection — a warm-connection re-test with interleaved trials showed no
+difference at all. One sample is not a measurement.
+
+Full detail in `latency.md`.
+
+---
+
+## 8. Testing a voice agent without a microphone
+
+The problem: testing normally needs a human talking. The solution here has
+three layers.
+
+**Offline** — `test_rules.py`: pure Python, 44 checks, free, instant.
+
+**Mic-less end to end** — `step6_e2e.py`. The trick: **Sarvam TTS speaks the
+user's lines too**, in a different voice. That audio is fed into the agent as
+20 ms frames, so the real VAD, STT, LLM, tools and TTS all run with nobody
+present. Priya's output audio is recorded to WAV instead of (or as well as)
+the speaker.
 
 ```text
 Voice (TTS, "rahul")  →  PCM  →  Pump  →  agent.step(frame)  →  real pipeline
                                                                       ↓
-                                              CapturePlayer → out/*.wav
+                                              CapturePlayer  →  out/*.wav
 ```
 
-Three scenarios: an emergency, a barge-in, and a complete booking.
+Design decisions that make it deterministic rather than flaky:
 
-Key design points:
+- Frames are fed at **true wall-clock rate**. Feeding faster would corrupt every
+  latency number, because the log assumes the 450 ms of endpointing silence
+  really took 450 ms.
+- Turn completion uses the three-condition latch from section 5, not a sleep.
+- `--dry` synthesizes each scripted line and runs the real VAD over it *offline*
+  before spending anything on the LLM. It catches the two things that actually
+  break a scripted run: a line with a pause over 450 ms splitting into two
+  turns, and a phone number being spoken as words instead of digits.
+- Tests point every data path at `out/` so the real files are never touched,
+  and `out/` is wiped on each run so it only ever shows the last one.
 
-- **Frames are fed at true wall-clock rate**, never faster. `latency.py`
-  backdates `t0` by 500 ms assuming that silence really took 500 ms — feeding
-  faster would corrupt every measurement.
-- **Turn completion uses a three-condition latch**, not a `sleep()`:
-  `reply_task.done()` AND `tts.idle.is_set()` AND `not player.busy()`. Each
-  alone is wrong — the task finishes before audio arrives, the player is
-  momentarily empty *between sentences*, and the TTS completion event fires
-  once per sentence rather than once per reply.
-- **`--dry` first.** It synthesizes each line, runs the real VAD over it
-  offline, and checks the STT transcript — catching the two things that
-  actually break a scripted run (a line with a pause over 500 ms splitting into
-  two turns, and a phone number spoken as words instead of digits) without
-  spending LLM credits.
-- Tests point `tools.BOOKINGS` at `out/` so real data is never touched.
-
-**This does not replace a real microphone test.** Synthesized speech is cleaner
-than a human voice, and barge-in *feel* plus VAD tuning under background noise
-can only be judged live.
+**Real microphone** — the final test, which only a person can do: run
+`python agent.py` and talk. Synthesized speech is cleaner than a human voice;
+barge-in *feel* and behaviour in a noisy room can only be judged live.
 
 ---
 
-## 9. Latency results
+## 9. Bugs found and fixed (and how each was diagnosed)
 
-Measured over 7 turns, two consecutive runs:
+These are the most valuable things to be able to talk about, because each one
+is a real root cause found with evidence, not a guess.
 
-| point | avg | worst |
-| --- | --- | --- |
-| vad_end | 500 ms | 500 ms |
-| stt_final | ~760 ms | 1036 ms |
-| llm_first_token | ~1900 ms | 2971 ms |
-| tts_first_audio | ~2000 ms | 3467 ms |
-| **playback_start (total)** | **~2000 ms** | **3492 ms** |
+**1. The pipeline forgot the booking mid-conversation.**
+*Symptom:* after the caller chose "12 noon with Dr. Ramesh" and gave name, age
+and phone, Priya asked "which department or doctor do you need?"
+*Diagnosis:* counted the messages in the transcript between the choice and the
+phone number — 18. History was trimmed to 12. Reproduced exactly in a text
+replay at 12; booked correctly at 40.
+*Fix:* `HISTORY_MESSAGES = 40`.
 
-Best single turn: 1428 ms. The target was under 1 second, so this does not meet
-it. Where the time goes:
+**2. Barge-in leaked audio.**
+*Symptom:* Priya sometimes kept talking for a moment after being interrupted.
+*Diagnosis:* `player.stop()` cleared the buffer, but the TTS socket was only
+abandoned inside a background task scheduled for the next loop tick. Until it
+ran, the socket's reader still passed its identity check and refilled the
+buffer.
+*Fix:* a synchronous `detach()` that nulls the socket before `stop()`. Verified
+by the harness: buffer 0 bytes on the interrupting frame, recording silent
+after the cut.
 
-| stage | cost | tunable? |
-| --- | --- | --- |
-| endpointing wait | 500 ms | Yes — `config.SILENCE_MS`, one line |
-| STT final after VAD end | ~257 ms | Somewhat |
-| **LLM first token** | **~1090 ms** | Yes — prompt size |
-| TTS first byte | ~575 ms | No, upstream |
-| playback start | ~16 ms | Already minimal |
+**3. Every barge-in leaked a socket, and Ctrl+C printed a traceback.**
+*Symptom:* `RuntimeError: Event loop is closed` at exit, sometimes twice.
+*Diagnosis:* enumerated the SSL transports still alive after shutdown — one
+`websockets` connection whose close had started but never finished. It
+appeared only in runs with a barge-in. Cause: `barge_in()` called `detach()`
+and discarded the socket it returned; `reset()` then called `detach()` again
+and found nothing. The socket was orphaned with its reader blocked forever. A
+21-turn session had leaked six.
+*Fix:* pass the detached socket into `reset(old)`. Plus a SIGINT handler that
+cancels only the main task so `close()` runs before asyncio tears everything
+down. Tested by delivering a real `KeyboardInterrupt` to the running agent:
+zero transports alive, no traceback.
 
-The LLM dominates. The same model returns its first token in ~780 ms against a
-two-line prompt, versus ~1090 ms here — the difference is the large system
-prompt (hospital details + 8 doctors + 15-day calendar). Shortening it is the
-biggest available lever, and it trades directly against the model's ability to
-resolve dates and quote fees correctly.
+**4. A "bug" that wasn't.**
+*Suspected:* `reasoning_effort=None` was being sent as literal `null` and might
+break every LLM call.
+*Diagnosis:* it was sent as `null` (verified by intercepting the request), but
+Sarvam accepts it, and five interleaved warm-connection trials showed no
+latency difference between omitting it, `None` and `"low"`. The dramatic
+difference in the first probe was cold-connection TLS setup.
+*Fix:* removed as a no-op. Lesson: verify before fixing.
 
-See `latency.md` for the full write-up, including a measurement that looked
-like a 3-second improvement and turned out to be TLS connection setup on a cold
-first call — a good reminder that one sample is not a measurement.
+**5. VAD hallucinated speech in a quiet room.**
+*Symptom:* the opening line was barged-in before the caller said anything;
+then `START / PAUSE / END` looped and nothing reached the LLM.
+*Diagnosis:* recorded 6 s of the actual room (RMS median 69 — quiet) and ran
+each VAD mode over it: mode 2 flagged 81 % of frames as speech, mode 3 flagged
+1 %.
+*Fix:* mode 3 plus an adaptive loudness gate. Verified with `calibrate.py`:
+zero false starts.
+
+**6. The filler delayed the thing it was covering for.**
+*Symptom:* on tool turns, `playback_start` came 550–650 ms after
+`tts_first_audio`.
+*Diagnosis:* "One moment, let me check." is 2 s of audio; the answer arrived
+1.2 s in and queued behind it.
+*Fix:* "One moment." (0.7 s). Gap now 10–40 ms.
+
+**7. A shorter silence timeout fragmented speech.**
+*Symptom:* at `SILENCE_MS = 300`, one scripted line produced three turns.
+*Diagnosis:* swept 250–500 ms against eleven real speech samples; natural
+phrase pauses run to ~450 ms.
+*Fix:* 450 ms — the honest floor, and 50 ms better than the original.
+
+**8. Pausing twice lost the first half of the sentence.**
+*Diagnosis:* the pause-merge overwrote the carried text instead of appending.
+*Fix:* accumulate.
+
+**9. Sockets died quietly.** STT dropped the audio chunk it was carrying on a
+reconnect; TTS errors left the idle latch stuck forever; a reconnect could
+recurse without bound. Each fixed; each now visible in the transcript.
+
+**10. Small things that bite.** The microphone emoji in the "Listening" line
+crashed on non-UTF-8 consoles. The phone number "9876543210" was synthesized
+as "nine billion eight hundred seventy-six million…" until the test script
+spelled it out digit by digit. The `.gitignore` ignored `.venv/` but the folder
+was `venv/`.
 
 ---
 
-## 10. Things worth knowing
+## 10. Interview questions, answered
 
-- **Use headphones.** There is no acoustic echo cancellation, so on speakers
-  the microphone hears Priya and the agent talks to itself.
-- **VAD fires on background noise.** At `VAD_MODE=2`, ambient room noise alone
-  triggered a speech-start in testing. Mode 3 or Silero VAD would help.
-- **The TTS socket times out** if left idle for about a minute. The keepalive
-  ping is silently ignored by the server, so the socket does close — but
-  `say()` detects it and reconnects, costing one small hiccup.
-- **`data/bookings.json` is the whole database.** Delete it to reset.
-- Run the pipeline stages in order (`step1_mic.py` → `step5_tts.py`) when
-  debugging; each one isolates a single block.
+**What is a cascading voice pipeline, and what is the alternative?**
+Separate STT, LLM and TTS models in sequence, each feeding the next. The
+alternative is speech-to-speech: one model, audio in, audio out. It is faster
+but there is no text in the middle to inspect — and the text in the middle is
+where the booking rules and tool calls live. For a business agent that must
+never invent a fee, cascading is the right trade.
 
----
-
-## 11. Interview questions, answered
-
-**What is a cascading voice pipeline? What is the other type?**
-Separate STT, LLM and TTS models chained in sequence, each waiting on the last.
-The alternative is speech-to-speech: one model, audio in and audio out, lower
-latency but much less control over the text in the middle — which is where tool
-calls and business rules live.
-
-**Where does latency come from?**
-Endpointing wait (~500 ms), STT final transcript (~250 ms), network to the LLM,
-LLM first token (~1090 ms, the biggest), collecting the first sentence, TTS
-first byte (~575 ms), playback start (~16 ms).
+**Where does the latency come from?**
+Endpointing wait (450 ms — deciding you've finished), STT final (~250 ms), LLM
+first token (~950 ms, the biggest), collecting the first sentence, TTS first
+byte (~450 ms), playback (~16 ms). About 1.65 s for a real answer, which is the
+floor of these three services.
 
 **Why is streaming important?**
-Without it you wait for the full transcript, then the full reply, then the full
-audio — serially. With it, the model starts writing while you are still being
-transcribed, and TTS starts speaking sentence one while sentence three is still
-being generated. It turns a sum of latencies into an overlap.
+Without it: wait for the full transcript, then the full reply, then the full
+audio — a sum. With it: the model writes while you're being transcribed, and
+TTS speaks sentence one while sentence three is still being written — an
+overlap. It is the single biggest latency technique.
 
-**What is VAD and what happens if the silence timeout is wrong?**
-Voice Activity Detection decides whether a frame is speech. Too short a timeout
-and the agent cuts you off when you pause to think; too long and it feels
-sluggish. 300–500 ms is the usual range.
+**What is VAD, and what happens if the silence timeout is wrong?**
+Voice Activity Detection: is this frame speech? Too short a timeout and the
+agent cuts you off when you pause to think; too long and it feels sluggish.
+Measured against real speech, natural phrase pauses run to ~450 ms, so that is
+the setting. Below it, sentences split into multiple turns.
 
-**What is barge-in and how did you build it?**
-Stopping the agent the moment the user speaks over it. Three things must happen
-together: cancel the LLM/reply task, detach the TTS socket synchronously so no
-more audio arrives, and clear the player buffer so queued audio stops. It also
-distinguishes a genuine interruption from the user merely pausing mid-sentence
-— in the pause case the partial text is kept and merged with what follows.
+**What is barge-in, and how did you build it?**
+Stopping the agent the moment the user talks over it. Three things at once:
+cancel the reply task, detach the TTS socket *synchronously* so no more audio
+arrives, clear the player buffer so queued audio stops. It also tells a real
+interruption from the user merely pausing mid-sentence — in the pause case the
+partial text is kept and merged. And on speakers, where the mic hears the
+agent, a barge-in must be loud *and sustained* for 300 ms, because echo is loud
+but bursty.
 
-**What is TTFT and TTFB?**
+**What are TTFT and TTFB?**
 Time To First Token — how long until the LLM's first token. Time To First Byte
-— how long until the first chunk of TTS audio. Both matter far more than total
-generation time, because playback starts at the first piece.
+— how long until the first TTS audio chunk. Both matter more than total time,
+because playback starts at the first piece.
 
 **Why should voice replies be short and plain?**
-You cannot hear markdown, bullet points or emoji, and a long reply means a long
-wait before the useful part. Numbers and symbols have to be written the way
-they are spoken: "nine hundred rupees", not "Rs.900".
+You cannot hear markdown, bullets or emoji, and a long reply means a long wait
+before the useful part. Numbers and symbols must be written as spoken: "nine
+hundred rupees", not "Rs.900".
 
 **How did you measure latency, and what was the best improvement?**
-`time.perf_counter()` marks at six named points per turn, with zero backdated
-to when the user actually stopped speaking rather than when VAD noticed.
-Average and worst print at exit. The most valuable change was not a speed-up
-but a correctness one: the timing report used to run inside the reply task,
-which kept the agent "busy" for up to 5 seconds and turned the user's next
-sentence into a barge-in that cancelled the report before it printed.
+`time.perf_counter()` marks at named points per turn, with zero backdated to
+when the user actually stopped talking rather than when VAD noticed. Average
+and worst print at exit. Measured every service directly and found the ~1.65 s
+floor is theirs. The biggest wins were around it: cached phrases (emergency
+1.5 s → 0.8 s), the filler on the first tool-call chunk, and the LLM warm-up
+that took 2.5 s off the first turn.
+
+**How did you test it without a microphone?**
+Had the TTS speak the user's lines in a different voice, fed that audio in as
+mic frames, and let the real pipeline run. The hard part was knowing when a
+reply had *finished* — no single signal is right, so three are required at
+once. Plus 44 offline checks of the rules, free.
+
+**How do you make sure the model doesn't book something invalid?**
+It can't. It only emits a function call; `book()` validates every rule in
+Python and returns an error the model must relay. The model never touches the
+data files.
+
+**How does it handle an emergency?**
+A keyword scan before the LLM runs. Dumber than the model, but it cannot be
+talked out of it, and it plays a pre-synthesized line in 0.8 s.
+
+**What would you do next?**
+Real acoustic echo cancellation so speakers don't need a firm voice. Silero VAD
+for noisier rooms. Sarvam's `codemix` STT mode for Telugu-English. And a
+smaller, faster LLM if one becomes available — the 950 ms first token is the
+wall.
+
+---
+
+## 11. Glossary
+
+| Term | Meaning |
+| --- | --- |
+| PCM | Raw audio samples, no compression. Here: 16-bit signed integers, 16 000 per second, one channel. |
+| Frame | 20 ms of audio = 320 samples = 640 bytes. The unit everything works in. |
+| RMS | Root mean square — a frame's loudness. Quiet room ~70, speech ~2000, max 32 767. |
+| Sample rate | Samples per second. 16 kHz is the standard for speech. |
+| VAD | Voice Activity Detection — speech or not, per frame. |
+| Endpointing | Deciding the user has finished their turn. |
+| Preroll | The 300 ms of audio kept from just before VAD confirmed speech, so the first syllable isn't lost. |
+| STT / ASR | Speech to text / automatic speech recognition. |
+| TTS | Text to speech. |
+| LLM | Large language model. |
+| TTFT / TTFB | Time to first token (LLM) / time to first byte (TTS). |
+| Tool calling | The model requesting a function; the code runs it and returns the result. |
+| Barge-in | Interrupting the agent mid-reply. |
+| AEC | Acoustic echo cancellation — subtracting the speaker's output from the mic input. Not in this project. |
+| WebSocket | A persistent two-way connection; used for STT and TTS so audio streams both ways with no per-request setup. |
+| asyncio | Python's single-threaded concurrency for I/O-bound work. |
+| Event loop | The scheduler that runs coroutines when the thing they were waiting for is ready. |
+| Latch | A condition that, once true, stays true — how the harness knows a reply is over. |
